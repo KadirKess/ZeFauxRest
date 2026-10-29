@@ -1,0 +1,32 @@
+# Build
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+*.pdf
+screenshot.ppm
+generated/*
+!generated/.gitkeep
+
+# Cache
+.cache/
+.codegraph/
+
+# Excluded from codegraph index (third-party noise)
+third_party/

@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Written to a colour target, not a depth one, because compute shaders can't
+// read a depth attachment directly. Each half-res pixel keeps the nearest of
+// the 4 full-res depths it covers, so the later upsample holds onto thin
+// foliage that a plain average would lose.
+layout(r32f, binding = 0) writeonly uniform image2D minDepth;
+
+uniform sampler2D gDepth;
+
+void main()
+{
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(minDepth);
+	if (px.x >= size.x || px.y >= size.y)
+		return;
+
+	ivec2 fp = px * 2;
+	float d0 = texelFetch(gDepth, fp, 0).r;
+	float d1 = texelFetch(gDepth, fp + ivec2(1, 0), 0).r;
+	float d2 = texelFetch(gDepth, fp + ivec2(0, 1), 0).r;
+	float d3 = texelFetch(gDepth, fp + ivec2(1, 1), 0).r;
+
+	imageStore(minDepth, px, vec4(min(min(d0, d1), min(d2, d3))));
+}

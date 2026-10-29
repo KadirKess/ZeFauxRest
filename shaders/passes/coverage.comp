@@ -1,0 +1,39 @@
+#version 450
+
+#include "../shared/noise.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(r16f, binding = 0) uniform readonly image2D heightmap;
+layout(r8, binding = 1) uniform writeonly image2D coverageMask;
+
+uniform float heightScale;
+uniform float worldStep; // world-space span of one heightmap texel
+
+// Single source of truth for grass and tree placement, slopeMask gates out
+// cliffs, coverageNoise breaks the field into patches.
+void main()
+{
+	ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(heightmap);
+	vec2 uv = (vec2(texel) + 0.5) / vec2(size);
+
+	ivec2 l = max(texel - ivec2(1, 0), ivec2(0));
+	ivec2 r = min(texel + ivec2(1, 0), size - 1);
+	ivec2 d = max(texel - ivec2(0, 1), ivec2(0));
+	ivec2 u = min(texel + ivec2(0, 1), size - 1);
+
+	float dX =
+		(imageLoad(heightmap, r).r - imageLoad(heightmap, l).r) * heightScale;
+	float dZ =
+		(imageLoad(heightmap, u).r - imageLoad(heightmap, d).r) * heightScale;
+	vec3 normal = normalize(vec3(-dX, 2.0 * worldStep, -dZ));
+
+	// Flat ground (normal.y near 1) is fully grassable, while anything past ~35 deg
+	// falls off to bare rock.
+	float slopeMask = smoothstep(0.80, 0.95, normal.y);
+
+	float coverageNoise = fbm(uv * 6.0, 4) * 0.5 + 0.5;
+	coverageNoise = smoothstep(0.35, 0.65, coverageNoise);
+
+	imageStore(coverageMask, texel, vec4(slopeMask * coverageNoise));
+}

@@ -1,0 +1,111 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D gAlbedo;
+layout(binding = 1) uniform sampler2D gNormal;
+layout(binding = 2) uniform sampler2D gDepth;
+layout(binding = 3) uniform sampler2D shadowMap;
+
+// RGBA16F, not RGB16F because imageStore needs a sized format from the
+// image-load/store table, and RGB16F isn't one.
+layout(rgba16f, binding = 0) writeonly uniform image2D litScene;
+
+layout(row_major, binding = 1) uniform ShadowUniforms
+{
+	mat4 lightSpaceMat;
+};
+
+uniform vec3 sunDir;
+uniform vec3 sunColor;
+uniform float sunIntensity;
+uniform vec3 skyAmbientColor;
+uniform float shadowStrength;
+uniform float specularStrength;
+uniform float foliageTranslucency;
+uniform mat4 invViewProj;
+uniform vec3 camPos;
+
+// Shape parameter, not a look knob, so it stays a shader constant.
+const float SHININESS = 32.0;
+
+// Soften the shadow edge by averaging 25 nearby samples instead of a few - a
+// few looks like hard steps, more gives a smooth grey. Anything outside the
+// shadow map is treated as lit so distant terrain doesn't go dark.
+const int kPcfHalf = 2;
+const float kPcfSpread = 1.5;
+
+// Sampling the same fixed pattern on every pixel lines the error up into a
+// visible checkerboard. Spinning the pattern a little per pixel breaks it into
+// noise that reads as a smooth soft edge.
+float interleavedGradientNoise(vec2 p)
+{
+	return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+float sampleShadow(vec3 worldPos, float ndotl)
+{
+	vec4 lp = lightSpaceMat * vec4(worldPos, 1.0);
+	vec3 proj = lp.xyz / lp.w * 0.5 + 0.5;
+	if (any(lessThan(proj, vec3(0.0))) || any(greaterThan(proj, vec3(1.0))))
+		return 1.0;
+
+	float bias = max(0.0015 * (1.0 - ndotl), 0.0005);
+	vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+
+	float angle =
+		interleavedGradientNoise(vec2(gl_GlobalInvocationID.xy)) * 6.2831853;
+	float s = sin(angle), c = cos(angle);
+	mat2 rot = mat2(c, -s, s, c);
+
+	float sum = 0.0;
+	for (int y = -kPcfHalf; y <= kPcfHalf; ++y)
+		for (int x = -kPcfHalf; x <= kPcfHalf; ++x)
+		{
+			vec2 off = rot * (vec2(x, y) * kPcfSpread) * texel;
+			float occluder = texture(shadowMap, proj.xy + off).r;
+			sum += proj.z - bias <= occluder ? 1.0 : 0.0;
+		}
+	float taps = float((2 * kPcfHalf + 1) * (2 * kPcfHalf + 1));
+	return sum / taps;
+}
+
+void main()
+{
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(litScene);
+	if (px.x >= size.x || px.y >= size.y)
+		return;
+
+	float depth = texelFetch(gDepth, px, 0).r;
+	if (depth >= 1.0)
+		return;
+
+	vec3 albedo = texelFetch(gAlbedo, px, 0).rgb;
+	vec3 N = normalize(texelFetch(gNormal, px, 0).xyz);
+
+	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec4 wp = invViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
+	vec3 worldPos = wp.xyz / wp.w;
+
+	float ndotl = max(dot(N, sunDir), 0.0);
+	float shadow = sampleShadow(worldPos, ndotl);
+
+	float directScale = mix(1.0 - shadowStrength, 1.0, shadow);
+	vec3 diffuse = sunColor * sunIntensity * ndotl * directScale;
+
+	vec3 V = normalize(camPos - worldPos);
+	vec3 H = normalize(sunDir + V);
+	float spec = pow(max(dot(N, H), 0.0), SHININESS);
+	vec3 specular = sunColor * spec * specularStrength * shadow;
+
+	float foliage = texelFetch(gNormal, px, 0).w;
+	vec3 backLight = foliage > 0.5 ? sunColor * vec3(1.0, 0.7, 0.4)
+			* max(0.0, -dot(N, sunDir)) * foliageTranslucency
+								   : vec3(0.0);
+
+	vec3 lit =
+		albedo * (diffuse + skyAmbientColor) + specular + albedo * backLight;
+	imageStore(litScene, px, vec4(lit, 1.0));
+}

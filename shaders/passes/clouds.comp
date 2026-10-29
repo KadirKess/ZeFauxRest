@@ -1,0 +1,144 @@
+#version 450
+
+#include "../shared/phase.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba16f, binding = 0) writeonly uniform image2D cloudRGBA;
+
+uniform sampler2D gDepth;
+uniform sampler3D shapeNoise; // 128^3, Perlin in R, Worley bands in GBA
+uniform sampler3D detailNoise; // 32^3, high-freq Worley erosion
+uniform sampler2D blueNoise; // 64x64 tileable dither for march-start jitter
+uniform mat4 invViewProj;
+uniform vec3 camPos;
+uniform vec3 sunColor;
+uniform vec3 cloudAmbientColor;
+uniform vec3 sunDir;
+uniform float cloudCoverage;
+uniform float cloudDensityScale;
+uniform float cloudDetailWeight; // edge erosion strength
+uniform float cloudPhaseG; // HG anisotropy
+
+// height-fraction gradient in cloudDensity reads H_BASE/H_TOP - keep them in
+// sync.
+const float H_BASE = 60.0;
+const float H_TOP = 120.0;
+const int MAX_STEPS = 48;
+
+// Caps the in-slab path so a near-horizontal ray (which would otherwise stay in
+// the slab for hundreds of units) can't accumulate into solid fog.
+const float MAX_MARCH = 180.0;
+// Extinction per unit density-length. Tuned so a full vertical traversal of
+// dense cloud reads as a soft layer, not an opaque wall.
+const float SIGMA = 0.08;
+
+// World-space size of one tile of the shape volume. The 32^3 detail tiles 8x
+// finer to add cauliflower edges.
+const float SHAPE_SCALE = 1.0 / 400.0;
+const float DETAIL_SCALE = SHAPE_SCALE * 8.0;
+
+float remap(float v, float a, float b, float c, float d)
+{
+	return c + (clamp(v, a, b) - a) / (b - a) * (d - c);
+}
+
+float cloudDensity(vec3 p)
+{
+	float hf = (p.y - H_BASE) / (H_TOP - H_BASE);
+	float gradient =
+		smoothstep(0.0, 0.2, hf) * (1.0 - smoothstep(0.6, 1.0, hf));
+	if (gradient <= 0.0)
+		return 0.0;
+
+	vec4 shape = texture(shapeNoise, p * SHAPE_SCALE);
+	// Schneider dilate-by-Worley, use the Worley bands as the low end of the
+	// Perlin remap so the soft base picks up billowy edges.
+	float wfbm = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+	float base = remap(shape.r, wfbm - 1.0, 1.0, 0.0, 1.0);
+
+	// Coverage carves clear sky between puffs - only the peaks survive.
+	base = remap(base, 1.0 - cloudCoverage, 1.0, 0.0, 1.0);
+	base *= gradient;
+	if (base <= 0.0)
+		return 0.0;
+
+	// Erode the edges with high-frequency detail, interiors stay solid.
+	float detail = texture(detailNoise, p * DETAIL_SCALE).r;
+	base = remap(base, detail * cloudDetailWeight, 1.0, 0.0, 1.0);
+
+	return max(0.0, base) * cloudDensityScale * SIGMA;
+}
+
+void main()
+{
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(cloudRGBA);
+	if (px.x >= size.x || px.y >= size.y)
+		return;
+
+	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+	vec2 ndc = uv * 2.0 - 1.0;
+
+	vec4 nearH = invViewProj * vec4(ndc, -1.0, 1.0);
+	vec4 farH = invViewProj * vec4(ndc, 1.0, 1.0);
+	vec3 ro = camPos;
+	vec3 rd = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
+
+	float tEntry = 0.0;
+	float tExit = -1.0;
+	if (abs(rd.y) > 1e-4)
+	{
+		float t0 = (H_BASE - ro.y) / rd.y;
+		float t1 = (H_TOP - ro.y) / rd.y;
+		tEntry = max(min(t0, t1), 0.0);
+		tExit = max(t0, t1);
+	}
+	float depth = texture(gDepth, uv).r;
+	if (depth < 1.0)
+	{
+		vec4 wp = invViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
+		tExit = min(tExit, distance(ro, wp.xyz / wp.w));
+	}
+	tExit = min(tExit, tEntry + MAX_MARCH);
+
+	if (tEntry >= tExit)
+	{
+		imageStore(cloudRGBA, px, vec4(0.0, 0.0, 0.0, 1.0));
+		return;
+	}
+
+	float stepLen = (tExit - tEntry) / float(MAX_STEPS);
+	// Jitter the march start by up to one step so the half-res samples don't
+	// band or crawl in motion.
+	float jitter = texture(blueNoise, vec2(px) / 64.0).r;
+	tEntry += jitter * stepLen;
+
+	// rd points away from the camera, sunDir toward the sun, so dot gives cos
+	// of the scatter angle the HG lobe wants.
+	float phase = hgPhase(dot(rd, sunDir), cloudPhaseG);
+
+	vec3 scattered = vec3(0.0);
+	float transmittance = 1.0;
+
+	for (int i = 0; i < MAX_STEPS; i++)
+	{
+		float t = tEntry + (float(i) + 0.5) * stepLen;
+		vec3 p = ro + rd * t;
+
+		float density = cloudDensity(p);
+		if (density > 0.0)
+		{
+			transmittance *= exp(-density * stepLen);
+			// Flat sky ambient so the shadow side reads as cloud, not
+			// silhouette.
+			vec3 light = sunColor * phase + cloudAmbientColor;
+			scattered += light * density * stepLen * transmittance;
+
+			if (transmittance < 0.01)
+				break;
+		}
+	}
+
+	imageStore(cloudRGBA, px, vec4(scattered, transmittance));
+}

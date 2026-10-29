@@ -1,0 +1,26 @@
+#version 450
+
+// R holds a soft base shape, GBA hold three bands of detail. The cloud march
+// combines them to carve out the cloud silhouette.
+
+#include "../shared/noise3d.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(rgba8, binding = 0) writeonly uniform image3D shapeVol;
+
+void main()
+{
+	ivec3 texel = ivec3(gl_GlobalInvocationID);
+	ivec3 size = imageSize(shapeVol);
+	if (texel.x >= size.x || texel.y >= size.y || texel.z >= size.z)
+		return;
+
+	vec3 uvw = (vec3(texel) + 0.5) / vec3(size);
+
+	float perlin = perlinFbm3(uvw, 4.0, 6);
+	float worleyLow = worleyFbm3(uvw, 4.0);
+	float worleyMid = worleyFbm3(uvw, 8.0);
+	float worleyHigh = worleyFbm3(uvw, 16.0);
+
+	imageStore(shapeVol, texel, vec4(perlin, worleyLow, worleyMid, worleyHigh));
+}

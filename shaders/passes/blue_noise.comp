@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(r8, binding = 0) uniform image2D blueNoise;
+
+float hash21(uvec2 p)
+{
+	uint n = p.x * 1597334677u ^ p.y * 3812015801u;
+	n = (n ^ (n >> 15)) * 2246822519u;
+	n = (n ^ (n >> 13)) * 3266489917u;
+	n ^= n >> 16;
+	return float(n) * (1.0 / 4294967295.0);
+}
+
+void main()
+{
+	ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+	if (texel.x >= imageSize(blueNoise).x || texel.y >= imageSize(blueNoise).y)
+		return;
+
+	float v = hash21(uvec2(texel));
+	imageStore(blueNoise, texel, vec4(v));
+}

@@ -1,0 +1,115 @@
+#version 450
+
+#include "../shared/phase.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// RGBA16F, not RGB16F because imageStore needs a sized format from the
+// image-load/store table, and RGB16F isn't one.
+layout(rgba16f, binding = 0) writeonly uniform image2D godrayRGB;
+
+uniform sampler2D gDepth;
+uniform sampler2D shadowMap;
+uniform sampler2D blueNoise;
+
+layout(row_major, binding = 1) uniform ShadowUniforms
+{
+	mat4 lightSpaceMat;
+};
+
+uniform mat4 invViewProj;
+uniform vec3 camPos;
+uniform vec3 lightColor;
+uniform vec3 sunDir; // unit surface-to-sun, same convention as clouds
+uniform float godrayIntensity;
+uniform float godrayPhaseG;
+uniform float godrayMaxDistance;
+uniform float godrayDensity;
+
+const int MAX_STEPS = 32;
+// How strongly the shafts glow. The raw value is too hot when added on, so
+// this scales it down to where the shafts read as a clear warm haze.
+const float GODRAY_SCATTER = 0.6;
+
+// Averaging a 5x5 block gives enough brightness levels to look smooth, while a
+// smaller block snapped into a visible checkerboard. The spacing spreads the
+// samples out to catch more of the leaf-shadow detail.
+const int PCF_RADIUS = 2;
+const float PCF_SPACING = 1.5;
+
+// Outside the shadow map we don't know what's blocking the sun, so the sample
+// adds nothing and the shafts stay inside the lit area. Inside, averaging
+// neighbours turns the hard lit/shadowed flip into a smooth fraction so nearby
+// rays look alike.
+float litInFrustum(vec3 p, vec2 texel)
+{
+	vec4 lp = lightSpaceMat * vec4(p, 1.0);
+	vec3 proj = lp.xyz / lp.w * 0.5 + 0.5;
+	if (any(lessThan(proj, vec3(0.0))) || any(greaterThan(proj, vec3(1.0))))
+		return 0.0;
+	float lit = 0.0;
+	for (int y = -PCF_RADIUS; y <= PCF_RADIUS; y++)
+		for (int x = -PCF_RADIUS; x <= PCF_RADIUS; x++)
+		{
+			vec2 off = vec2(x, y) * texel * PCF_SPACING;
+			float o = texture(shadowMap, proj.xy + off).r;
+			lit += proj.z <= o + 0.002 ? 1.0 : 0.0;
+		}
+	float taps = float((2 * PCF_RADIUS + 1) * (2 * PCF_RADIUS + 1));
+	return lit / taps;
+}
+
+void main()
+{
+	ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(godrayRGB);
+	if (px.x >= size.x || px.y >= size.y)
+		return;
+
+	vec2 uv = (vec2(px) + 0.5) / vec2(size);
+	vec2 ndc = uv * 2.0 - 1.0;
+
+	vec4 nearH = invViewProj * vec4(ndc, -1.0, 1.0);
+	vec4 farH = invViewProj * vec4(ndc, 1.0, 1.0);
+	vec3 ro = camPos;
+	vec3 rd = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
+
+	// March end driven by scene depth so no steps are wasted past geometry,
+	// background runs to the distance cap.
+	float depth = texture(gDepth, uv).r;
+	float marchLen = godrayMaxDistance;
+	if (depth < 1.0)
+	{
+		vec4 wp = invViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
+		marchLen = min(distance(ro, wp.xyz / wp.w), godrayMaxDistance);
+	}
+
+	float stepLen = marchLen / float(MAX_STEPS);
+	// No march-start dither because on these soft half-res shafts the grain read worse
+	// than the banding. Raise MAX_STEPS if banding shows.
+
+	vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+
+	// Walk along the ray adding up the lit steps, but fade each step's
+	// contribution the further it is from the camera - that's what shapes the
+	// shafts. The final density factor caps a fully-lit ray so it can't grow
+	// without limit.
+	float transmittance = 1.0;
+	float inscatter = 0.0;
+	for (int i = 0; i < MAX_STEPS; i++)
+	{
+		vec3 p = ro + rd * ((float(i) + 0.5) * stepLen);
+		float lit = litInFrustum(p, texel);
+		transmittance *= exp(-godrayDensity * stepLen);
+		inscatter += lit * transmittance * stepLen;
+	}
+	inscatter *= godrayDensity;
+
+	// Forward-scattering toward the sun turns the isotropic lit-fraction into
+	// shafts.
+	float phase = hgPhase(dot(rd, sunDir), godrayPhaseG);
+
+	vec3 color =
+		lightColor * godrayIntensity * GODRAY_SCATTER * phase * inscatter;
+	imageStore(godrayRGB, px, vec4(color, 1.0));
+}

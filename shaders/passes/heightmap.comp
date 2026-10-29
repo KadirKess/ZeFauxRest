@@ -1,0 +1,49 @@
+#version 450
+
+#include "../shared/noise.glsl"
+
+#define NOISE_MODE_SIMPLE_PERLIN 0
+#define NOISE_MODE_FULL 1
+
+#ifndef NOISE_MODE
+#	define NOISE_MODE NOISE_MODE_SIMPLE_PERLIN
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(r16f, binding = 0) uniform image2D heightmap;
+
+// Radius (in the r = 2*|uv-0.5| metric, so 1.0 == tile mid-edge) of the flat
+// central clearing, and where the edge falloff starts pulling heights to 0.
+const float kClearRadius = 0.18;
+const float kEdgeStart = 0.72;
+
+// Layered ridge noise shaped by distance from the centre, flat in the middle
+// clearing, full height in the surrounding ring, dropping back to 0 at the
+// edge so the terrain hides the horizon behind the treeline.
+float terrainHeight(vec2 uv)
+{
+	vec2 warped = domainWarp(uv * 3.0, 0.5);
+	float elevation = ridged(warped, 6);
+
+	float r = length(uv - 0.5) * 2.0;
+	float clearing = smoothstep(0.0, kClearRadius, r);
+	float edge = 1.0 - smoothstep(kEdgeStart, 1.0, r);
+
+	return elevation * clearing * edge;
+}
+
+void main()
+{
+	ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+	vec2 size = vec2(imageSize(heightmap));
+	vec2 uv = (vec2(texel) + 0.5) / size;
+
+	float height;
+#if NOISE_MODE == NOISE_MODE_SIMPLE_PERLIN
+	height = perlin(uv * 4.0) * 0.5 + 0.5;
+#elif NOISE_MODE == NOISE_MODE_FULL
+	height = terrainHeight(uv);
+#endif
+
+	imageStore(heightmap, texel, vec4(height, 0.0, 0.0, 1.0));
+}

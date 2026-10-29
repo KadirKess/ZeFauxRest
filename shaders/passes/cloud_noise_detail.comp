@@ -1,0 +1,19 @@
+#version 450
+
+#include "../shared/noise3d.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(r8, binding = 0) writeonly uniform image3D detailVol;
+
+void main()
+{
+	ivec3 texel = ivec3(gl_GlobalInvocationID);
+	ivec3 size = imageSize(detailVol);
+	if (texel.x >= size.x || texel.y >= size.y || texel.z >= size.z)
+		return;
+
+	vec3 uvw = (vec3(texel) + 0.5) / vec3(size);
+	float detail = worleyFbm3(uvw, 4.0);
+
+	imageStore(detailVol, texel, vec4(detail));
+}
